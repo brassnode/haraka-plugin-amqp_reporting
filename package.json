@@ -4,8 +4,9 @@
   "description": "Haraka plugin that publishes outbound delivery outcome events to a RabbitMQ topic exchange",
   "main": "index.js",
   "files": [
-    "CHANGELOG.md",
-    "config"
+    "index.js",
+    "config",
+    "CHANGELOG.md"
   ],
   "engines": {
     "node": ">=22"
