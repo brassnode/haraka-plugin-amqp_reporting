@@ -4,7 +4,11 @@ const amqplib = require('amqplib/callback_api')
 
 const plugin = exports
 
+// ─── Setup / Configuration ───────────────────────────────────────────────────
+
 plugin.register = function () {
+  this._publishQueue = []
+
   this.load_amqp_reporting_ini()
 
   if (!this.cfg.main.enabled) {
@@ -13,32 +17,63 @@ plugin.register = function () {
   }
 
   this.register_hook('init_child', 'hook_init_child')
-  this.register_hook('queue',      'hook_queue')
-  this.register_hook('delivered',  'hook_delivered')
-  this.register_hook('bounce',     'hook_bounce')
-  this.register_hook('deferred',   'hook_deferred')
+  this.register_hook('shutdown', 'hook_shutdown')
+  this.register_hook('queue', 'hook_queue')
+  this.register_hook('delivered', 'hook_delivered')
+  this.register_hook('bounce', 'hook_bounce')
+  this.register_hook('deferred', 'hook_deferred')
 }
 
 plugin.load_amqp_reporting_ini = function () {
-  this.cfg = this.config.get(
-    'amqp_reporting.ini',
-    { booleans: ['+enabled'] },
-    () => { this.load_amqp_reporting_ini() },
+  this.cfg = this.config.get('amqp_reporting.ini', { booleans: ['+enabled'] }, () => {
+    this.load_amqp_reporting_ini()
+  })
+  this._sanitizedUrl = this._sanitize_url(this.cfg.connection.amqp_url)
+}
+
+// ─── Lifecycle Hooks ─────────────────────────────────────────────────────────
+
+plugin.hook_init_child = function (next) {
+  this._reconnectDelay = 1000
+  this._connect_and_setup(
+    (err) => {
+      this.logerror(`AMQP connect failed [${this._sanitizedUrl}]: ${err.message}`)
+      this._reconnect()
+      next()
+    },
+    (exchange) => {
+      this.loginfo(`AMQP ready - exchange: ${exchange}`)
+      next()
+    },
+    () => next(),
   )
 }
 
-plugin.hook_init_child = function (next) {
-  const url = this.cfg.main.amqp_url
+plugin.hook_shutdown = function (next) {
+  this._shuttingDown = true
+  if (this._reconnectTimer) {
+    clearTimeout(this._reconnectTimer)
+    this._reconnectTimer = null
+  }
+  if (!this.amqp) return next()
+  const { conn } = this.amqp
+  this.amqp = null
+  conn.close((err) => {
+    if (err) this.logerror(`AMQP close error: ${err.message}`)
+    next()
+  })
+}
+
+// ─── AMQP Connection Management ──────────────────────────────────────────────
+
+plugin._connect_and_setup = function (onConnectError, onReady, onSetupError) {
+  const url = this.cfg.connection.amqp_url
   this._connect(url, (err, conn) => {
-    if (err) {
-      this.logerror(`AMQP connect failed: ${err.message}`)
-      return next()
-    }
-    conn.on('error', (e) => {
-      this.logerror(`AMQP connection error: ${e.message}`)
-      this.amqp = null
-    })
-    conn.createConfirmChannel((assertErr, ch) => this._setup_channel(next, conn, assertErr, ch))
+    if (err) return onConnectError(err)
+    this._attach_connection_error_handler(conn)
+    conn.createConfirmChannel((chErr, ch) =>
+      this._setup_channel(conn, chErr, ch, onReady, onSetupError),
+    )
   })
 }
 
@@ -46,123 +81,216 @@ plugin._connect = function (url, cb) {
   amqplib.connect(url, cb)
 }
 
-plugin._setup_channel = function (next, conn, err, ch) {
+plugin._setup_channel = function (conn, err, ch, onSuccess, onError) {
   if (err) {
     this.logerror(`AMQP channel failed: ${err.message}`)
-    return next()
+    conn.close(() => {})
+    return onError()
   }
-  const exchange = this.cfg.main.exchange
+  const exchange = this.cfg.publishing.exchange
   ch.assertExchange(exchange, 'topic', { durable: true }, (assertErr) => {
     if (assertErr) {
       this.logerror(`AMQP assertExchange failed: ${assertErr.message}`)
-      return next()
+      conn.close(() => {})
+      return onError()
     }
     this.amqp = { conn, ch, exchange }
-    this.loginfo(`AMQP ready - exchange: ${exchange}`)
-    next()
+    this._flushQueue()
+    onSuccess(exchange)
   })
 }
+
+plugin._attach_connection_error_handler = function (conn) {
+  conn.on('error', (e) => {
+    this.logerror(`AMQP connection error: ${e.message}`)
+    if (!this.amqp) return
+    this.amqp = null
+    this._reconnect()
+  })
+}
+
+plugin._reconnect = function () {
+  if (this._shuttingDown) return
+  const maxDelay = this.cfg?.connection?.max_reconnect_delay_ms ?? 30000
+  const delay = Math.min(this._reconnectDelay, maxDelay)
+  this._reconnectDelay = Math.min(this._reconnectDelay * 2, maxDelay)
+  this.logdebug(`AMQP reconnecting in ${delay}ms`)
+  this._reconnectTimer = setTimeout(() => {
+    this._reconnectTimer = null
+    this._connect_and_setup(
+      (err) => {
+        this.logerror(`AMQP reconnect failed [${this._sanitizedUrl}]: ${err.message}`)
+        this._reconnect()
+      },
+      (exchange) => {
+        this._reconnectDelay = 1000
+        this.loginfo(`AMQP reconnected - exchange: ${exchange}`)
+      },
+      () => this._reconnect(),
+    )
+  }, delay)
+}
+
+plugin._sanitize_url = function (url) {
+  try {
+    const u = new URL(url)
+    if (u.password) u.password = '***'
+    return u.toString()
+  } catch {
+    return url
+  }
+}
+
+// ─── Mail Hooks ───────────────────────────────────────────────────────────────
 
 plugin.hook_queue = function (next, connection) {
   const txn = connection.transaction
   if (!txn) return next()
 
-  const jobId = txn.header.get('X-Job-Id') || ''
-  const ipId  = txn.header.get('X-Ip-Id')  || ''
+  const jobIdHeader = this.cfg?.headers?.job_id_header || null
+  const ipIdHeader = this.cfg?.headers?.ip_id_header || null
 
-  txn.notes.amqp_job_id = jobId.trim()
-  txn.notes.amqp_ip_id  = ipId.trim()
+  txn.notes.amqp_job_id = jobIdHeader ? (txn.header.get(jobIdHeader) || '').trim() : ''
+  txn.notes.amqp_ip_id = ipIdHeader ? (txn.header.get(ipIdHeader) || '').trim() : ''
 
-  txn.remove_header('X-Job-Id')
-  txn.remove_header('X-Ip-Id')
+  if (jobIdHeader) txn.remove_header(jobIdHeader)
+  if (ipIdHeader) txn.remove_header(ipIdHeader)
 
   next()
 }
 
-plugin.hook_delivered = function (next, hmail, connection, params) {
-  const notes  = (hmail && hmail.todo && hmail.todo.notes) || {}
-  const rcpt   = params && params[0] ? params[0].address() : ''
-  const msg    = (params && params[1]) || ''
-  const domain = (params && params[2]) || ''
-
-  this._publish('outcome.delivered', {
-    jobId:            notes.amqp_job_id || '',
-    ipId:             notes.amqp_ip_id  || '',
-    status:           'delivered',
-    smtpCode:         this._parse_smtp_code(msg, 250),
-    smtpMessage:      msg,
-    recipientAddress: rcpt,
-    domain,
-    attemptedAt:      new Date().toISOString(),
-  })
+plugin.hook_delivered = function (next, hmail, params) {
+  const { notes } = this._extract_hmail_context(hmail)
+  const response = (params && params[2]) || ''
+  const okRcpts = (params && params[6]) || []
+  const domain = (hmail && hmail.todo && hmail.todo.domain) || (params && params[0]) || ''
+  const code = this._parse_smtp_code(response, 250)
 
   next()
+
+  for (const rcpt of okRcpts) {
+    const address = rcpt.address()
+    this.logdebug(
+      `delivered - jobId: ${notes.amqp_job_id || '(none)'}, rcpt: ${address}, domain: ${domain}, smtpCode: ${code}`,
+    )
+    const event = this._build_outcome_event(notes, 'delivered', code, response, address, domain)
+    this._publish('outcome.delivered', event)
+  }
 }
 
 plugin.hook_bounce = function (next, hmail, error) {
-  const notes = (hmail && hmail.todo && hmail.todo.notes) || {}
-  const rcpts = (hmail && hmail.todo && hmail.todo.rcpt_to) || []
-  const code  = (error && error.code) || 0
-  const msg   = (error && error.message) || ''
-
-  this._publish('outcome.bounced', {
-    jobId:            notes.amqp_job_id || '',
-    ipId:             notes.amqp_ip_id  || '',
-    status:           'bounced',
-    smtpCode:         code,
-    smtpMessage:      msg,
-    recipientAddress: rcpts.length ? rcpts[0].address() : '',
-    domain:           (hmail && hmail.todo && hmail.todo.domain) || '',
-    attemptedAt:      new Date().toISOString(),
-  })
+  const { notes, domain, rcpts } = this._extract_hmail_context(hmail)
+  const code = (error && error.code) || 0
+  const msg = (error && error.message) || ''
 
   next()
+
+  for (const rcptObj of rcpts) {
+    const address = rcptObj.address()
+    this.logdebug(
+      `bounce - jobId: ${notes.amqp_job_id || '(none)'}, rcpt: ${address}, domain: ${domain}, smtpCode: ${code}, msg: ${msg}`,
+    )
+    const event = this._build_outcome_event(notes, 'bounced', code, msg, address, domain)
+    this._publish('outcome.bounced', event)
+  }
 }
 
 plugin.hook_deferred = function (next, hmail, params) {
-  const notes  = (hmail && hmail.todo && hmail.todo.notes) || {}
-  const domain = (params && params[0]) || ''
-  const msg    = (params && params[1]) || ''
-  const rcpt   = params && params[2] ? params[2].address() : ''
-
-  this._publish('outcome.deferred', {
-    jobId:            notes.amqp_job_id || '',
-    ipId:             notes.amqp_ip_id  || '',
-    status:           'deferred',
-    smtpCode:         this._parse_smtp_code(msg, 421),
-    smtpMessage:      msg,
-    recipientAddress: rcpt,
-    domain,
-    attemptedAt:      new Date().toISOString(),
-  })
+  const { notes, domain, rcpts } = this._extract_hmail_context(hmail)
+  const msg = (params && params.err) || ''
+  const delay = (params && params.delay) || 0
+  const code = this._parse_smtp_code(msg, 421)
 
   next()
+
+  for (const rcptObj of rcpts) {
+    const address = rcptObj.address()
+    this.logdebug(
+      `deferred - jobId: ${notes.amqp_job_id || '(none)'}, rcpt: ${address}, domain: ${domain}, smtpCode: ${code}, delay: ${delay}s, msg: ${msg}`,
+    )
+    const event = this._build_outcome_event(notes, 'deferred', code, msg, address, domain)
+    this._publish('outcome.deferred', event)
+  }
 }
 
-plugin._publish = function (routingKey, event) {
-  if (!this.amqp) return
+// ─── Event Helpers ────────────────────────────────────────────────────────────
 
-  const { ch, exchange } = this.amqp
-  const body    = Buffer.from(JSON.stringify(event))
-  const options = { persistent: true, mandatory: true }
-  const timeout = this.PUBLISH_TIMEOUT !== undefined ? this.PUBLISH_TIMEOUT : 5000
+plugin._extract_hmail_context = function (hmail) {
+  const todo = (hmail && hmail.todo) || {}
+  const notes = todo.notes || {}
+  const rcpts = todo.rcpt_to || []
+  return {
+    notes,
+    domain: todo.domain || '',
+    rcpts,
+    rcpt: rcpts.length ? rcpts[0].address() : '',
+  }
+}
 
-  let settled = false
-
-  const timer = setTimeout(() => {
-    settled = true
-    this.logerror(`AMQP publish timeout - routingKey: ${routingKey}, jobId: ${event.jobId}`)
-  }, timeout)
-
-  ch.publish(exchange, routingKey, body, options, (err) => {
-    if (settled) return
-    settled = true
-    clearTimeout(timer)
-    if (err) this.logerror(`AMQP publish nack - routingKey: ${routingKey}: ${err.message}`)
-  })
+plugin._build_outcome_event = function (notes, status, code, message, rcpt, domain) {
+  return {
+    jobId: notes.amqp_job_id || '',
+    ipId: notes.amqp_ip_id || '',
+    status,
+    smtpCode: code,
+    smtpMessage: message,
+    recipientAddress: rcpt,
+    domain,
+    attemptedAt: new Date().toISOString(),
+  }
 }
 
 plugin._parse_smtp_code = function (msg, fallback) {
   const m = /^(\d{3})/.exec(msg || '')
   return m ? parseInt(m[1], 10) : fallback
+}
+
+// ─── Publishing ───────────────────────────────────────────────────────────────
+
+plugin._publish = function (routingKey, event) {
+  if (!this.amqp) {
+    const maxQueueSize = this.cfg?.publishing?.max_queue_size ?? 100
+    if (this._publishQueue.length < maxQueueSize) {
+      this._publishQueue.push({ routingKey, event })
+      this.logdebug(
+        `AMQP not connected - queued event (${this._publishQueue.length}/${maxQueueSize}): routingKey: ${routingKey}, jobId: ${event.jobId}`,
+      )
+    } else {
+      this.logwarn(
+        `AMQP not connected - queue full, dropping event: routingKey: ${routingKey}, jobId: ${event.jobId}`,
+      )
+    }
+    return
+  }
+
+  const { ch, exchange } = this.amqp
+  const body = Buffer.from(JSON.stringify(event))
+  const options = { persistent: true, mandatory: true }
+  const timeout = this.cfg?.publishing?.publish_timeout_ms ?? this.PUBLISH_TIMEOUT ?? 5000
+
+  let ackHandled = false
+
+  const timer = setTimeout(() => {
+    ackHandled = true
+    this.logerror(`AMQP publish timeout - routingKey: ${routingKey}, jobId: ${event.jobId}`)
+  }, timeout)
+
+  ch.publish(exchange, routingKey, body, options, (err) => {
+    if (ackHandled) return
+    ackHandled = true
+    clearTimeout(timer)
+    if (err) {
+      this.logerror(`AMQP publish nack - routingKey: ${routingKey}: ${err.message}`)
+    } else {
+      this.logdebug(`published - routingKey: ${routingKey}, jobId: ${event.jobId}`)
+    }
+  })
+}
+
+plugin._flushQueue = function () {
+  if (!this._publishQueue.length) return
+  this.logdebug(`AMQP flushing ${this._publishQueue.length} queued event(s)`)
+  for (const { routingKey, event } of this._publishQueue.splice(0)) {
+    this._publish(routingKey, event)
+  }
 }
