@@ -15,7 +15,7 @@ Reports `delivered`, `bounced`, and `deferred` outcomes after each delivery atte
 - Confirm-channel publishing — the broker acknowledges each message before the plugin considers it sent
 - 5-second per-publish timeout prevents a stalled broker from blocking Haraka's delivery pipeline
 - One AMQP connection per worker process; connections are isolated and re-established automatically on worker restart
-- Stashes `X-Job-Id` and `X-Ip-Id` headers at queue time and strips them from the outbound message
+- Stashes `X-Job-Id` header at queue time and strips it from the outbound message
 - Compatible with any AMQP 0-9-1 broker via `amqp://` or `amqps://` URLs (RabbitMQ, AWS MQ, CloudAMQP, etc.)
 
 ## Requirements
@@ -81,7 +81,7 @@ The plugin uses two inbound hooks and three outbound delivery hooks:
 | Hook         | Action                                                             |
 | ------------ | ------------------------------------------------------------------ |
 | `init_child` | Opens one AMQP connection + confirm channel per worker process     |
-| `queue`      | Stashes `X-Job-Id`/`X-Ip-Id` into `hmail.todo.notes`; strips both  |
+| `queue`      | Stashes `X-Job-Id` into `hmail.todo.notes`; strips it from message |
 | `delivered`  | Publishes `outcome.delivered` after a 2xx acceptance               |
 | `bounce`     | Publishes `outcome.bounced` after a permanent 5xx or exhausted 4xx |
 | `deferred`   | Publishes `outcome.deferred` on each temporary 4xx deferral        |
@@ -93,7 +93,6 @@ Every message published to RabbitMQ has the following JSON body:
 | Field              | Type   | Description                                           |
 | ------------------ | ------ | ----------------------------------------------------- |
 | `jobId`            | string | Value of `X-Job-Id` header stashed at queue time      |
-| `ipId`             | string | Value of `X-Ip-Id` header stashed at queue time       |
 | `status`           | string | `"delivered"`, `"bounced"`, or `"deferred"`           |
 | `smtpCode`         | number | Numeric SMTP response code (e.g. `250`, `550`, `421`) |
 | `smtpMessage`      | string | Full SMTP response text                               |

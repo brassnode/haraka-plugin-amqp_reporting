@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.4 - 2026-05-15
+
+### Removed
+
+- `X-Ip-Id` references from README — header and `ipId` field were already removed from the code in 1.1.3
+
 ## 1.1.3 - 2026-05-15
 
 ### Added
