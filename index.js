@@ -15,17 +15,10 @@ plugin.register = function () {
     this.loginfo('disabled via config')
     return
   }
-
-  this.register_hook('init_child', 'hook_init_child')
-  this.register_hook('shutdown', 'hook_shutdown')
-  this.register_hook('queue', 'hook_queue')
-  this.register_hook('delivered', 'hook_delivered')
-  this.register_hook('bounce', 'hook_bounce')
-  this.register_hook('deferred', 'hook_deferred')
 }
 
 plugin.load_amqp_reporting_ini = function () {
-  this.cfg = this.config.get('amqp_reporting.ini', { booleans: ['+enabled'] }, () => {
+  this.cfg = this.config.get('amqp_reporting.ini', { booleans: ['+main.enabled'] }, () => {
     this.load_amqp_reporting_ini()
   })
   this._sanitizedUrl = this._sanitize_url(this.cfg.connection.amqp_url)
@@ -143,28 +136,38 @@ plugin._sanitize_url = function (url) {
 
 // ─── Mail Hooks ───────────────────────────────────────────────────────────────
 
-plugin.hook_queue = function (next, connection) {
+plugin.hook_queue_outbound = function (next, connection) {
   const txn = connection.transaction
   if (!txn) return next()
 
   const jobIdHeader = this.cfg?.headers?.job_id_header || null
-  const ipIdHeader = this.cfg?.headers?.ip_id_header || null
+  const rawJob = jobIdHeader ? txn.header.get(jobIdHeader) : null
+  txn.notes.amqp_job_id = rawJob ? rawJob.trim() : ''
 
-  txn.notes.amqp_job_id = jobIdHeader ? (txn.header.get(jobIdHeader) || '').trim() : ''
-  txn.notes.amqp_ip_id = ipIdHeader ? (txn.header.get(ipIdHeader) || '').trim() : ''
+  const rawMsgId = txn.header.get('Message-ID') || ''
+  txn.notes.amqp_message_id = rawMsgId.replace(/^<|>$/g, '').trim()
 
   if (jobIdHeader) txn.remove_header(jobIdHeader)
-  if (ipIdHeader) txn.remove_header(ipIdHeader)
 
   next()
 }
 
 plugin.hook_delivered = function (next, hmail, params) {
-  const { notes } = this._extract_hmail_context(hmail)
+  if (hmail && hmail._amqp_delivered_seen) return next()
+  if (hmail) hmail._amqp_delivered_seen = true
+
+  const context = this._extract_hmail_context(hmail)
+  const { notes, domain } = context
   const response = (params && params[2]) || ''
   const okRcpts = (params && params[6]) || []
-  const domain = (hmail && hmail.todo && hmail.todo.domain) || (params && params[0]) || ''
   const code = this._parse_smtp_code(response, 250)
+
+  const connectionDetails = {
+    mxHost: (params && params[0]) || '',
+    outboundIp: (params && params[1]) || '',
+    port: (params && params[4]) || null,
+    protocol: (params && params[5]) || '',
+  }
 
   next()
 
@@ -173,13 +176,20 @@ plugin.hook_delivered = function (next, hmail, params) {
     this.logdebug(
       `delivered - jobId: ${notes.amqp_job_id || '(none)'}, rcpt: ${address}, domain: ${domain}, smtpCode: ${code}`,
     )
-    const event = this._build_outcome_event(notes, 'delivered', code, response, address, domain)
+    const event = this._build_outcome_event(context, {
+      status: 'delivered',
+      code,
+      message: response,
+      rcpt: address,
+      ...connectionDetails,
+    })
     this._publish('outcome.delivered', event)
   }
 }
 
 plugin.hook_bounce = function (next, hmail, error) {
-  const { notes, domain, rcpts } = this._extract_hmail_context(hmail)
+  const context = this._extract_hmail_context(hmail)
+  const { notes, domain, rcpts } = context
   const code = (error && error.code) || 0
   const msg = (error && error.message) || ''
 
@@ -190,13 +200,19 @@ plugin.hook_bounce = function (next, hmail, error) {
     this.logdebug(
       `bounce - jobId: ${notes.amqp_job_id || '(none)'}, rcpt: ${address}, domain: ${domain}, smtpCode: ${code}, msg: ${msg}`,
     )
-    const event = this._build_outcome_event(notes, 'bounced', code, msg, address, domain)
+    const event = this._build_outcome_event(context, {
+      status: 'bounced',
+      code,
+      message: msg,
+      rcpt: address,
+    })
     this._publish('outcome.bounced', event)
   }
 }
 
 plugin.hook_deferred = function (next, hmail, params) {
-  const { notes, domain, rcpts } = this._extract_hmail_context(hmail)
+  const context = this._extract_hmail_context(hmail)
+  const { notes, domain, rcpts } = context
   const msg = (params && params.err) || ''
   const delay = (params && params.delay) || 0
   const code = this._parse_smtp_code(msg, 421)
@@ -208,7 +224,12 @@ plugin.hook_deferred = function (next, hmail, params) {
     this.logdebug(
       `deferred - jobId: ${notes.amqp_job_id || '(none)'}, rcpt: ${address}, domain: ${domain}, smtpCode: ${code}, delay: ${delay}s, msg: ${msg}`,
     )
-    const event = this._build_outcome_event(notes, 'deferred', code, msg, address, domain)
+    const event = this._build_outcome_event(context, {
+      status: 'deferred',
+      code,
+      message: msg,
+      rcpt: address,
+    })
     this._publish('outcome.deferred', event)
   }
 }
@@ -221,22 +242,44 @@ plugin._extract_hmail_context = function (hmail) {
   const rcpts = todo.rcpt_to || []
   return {
     notes,
+    queueId: todo.uuid || '',
+    messageId: notes.amqp_message_id || '',
+    senderAddress: todo.mail_from ? todo.mail_from.address() : '',
     domain: todo.domain || '',
     rcpts,
     rcpt: rcpts.length ? rcpts[0].address() : '',
+    retryCount: (hmail && hmail.num_failures) || 0,
   }
 }
 
-plugin._build_outcome_event = function (notes, status, code, message, rcpt, domain) {
+plugin._build_outcome_event = function (context, params) {
+  const {
+    status,
+    code,
+    message,
+    rcpt,
+    mxHost = null,
+    outboundIp = null,
+    port = null,
+    protocol = null,
+  } = params
+  const { notes, queueId, messageId, senderAddress, domain, retryCount } = context
   return {
     jobId: notes.amqp_job_id || '',
-    ipId: notes.amqp_ip_id || '',
+    queueId,
+    messageId,
+    senderAddress,
     status,
     smtpCode: code,
     smtpMessage: message,
     recipientAddress: rcpt,
     domain,
-    attemptedAt: new Date().toISOString(),
+    mxHost,
+    outboundIp,
+    port,
+    protocol,
+    retryCount,
+    attemptedAt: Date.now(),
   }
 }
 

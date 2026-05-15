@@ -45,11 +45,11 @@ describe('plugin', () => {
 // ─── register ────────────────────────────────────────────────────────────────
 
 describe('register', () => {
-  it('registers all hooks when enabled', () => {
+  it('makes no explicit register_hook calls when enabled', () => {
     const registered = []
     plugin.register_hook = (e) => registered.push(e)
     plugin.register()
-    assert.deepStrictEqual(registered, ['init_child', 'shutdown', 'queue', 'delivered', 'bounce', 'deferred'])
+    assert.deepStrictEqual(registered, [])
   })
 
   it('returns early and logs when disabled', () => {
@@ -239,9 +239,9 @@ describe('hook_shutdown', () => {
   })
 })
 
-// ─── hook_queue ──────────────────────────────────────────────────────────────
+// ─── hook_queue_outbound ──────────────────────────────────────────────────────────────
 
-describe('hook_queue', () => {
+describe('hook_queue_outbound', () => {
   let conn
 
   beforeEach(() => {
@@ -253,69 +253,60 @@ describe('hook_queue', () => {
 
   it('stashes job_id from X-Job-Id header', () => {
     conn.transaction.header.add('X-Job-Id', 'job-abc')
-    plugin.hook_queue(() => {}, conn)
+    plugin.hook_queue_outbound(() => {}, conn)
     assert.strictEqual(conn.transaction.notes.amqp_job_id, 'job-abc')
   })
 
-  it('stashes ip_id from X-Ip-Id header', () => {
-    conn.transaction.header.add('X-Ip-Id', 'ip-123')
-    plugin.hook_queue(() => {}, conn)
-    assert.strictEqual(conn.transaction.notes.amqp_ip_id, 'ip-123')
+  it('stashes empty string when job header is absent', () => {
+    plugin.hook_queue_outbound(() => {}, conn)
+    assert.strictEqual(conn.transaction.notes.amqp_job_id, '')
   })
 
-  it('stashes empty strings when headers are absent', () => {
-    plugin.hook_queue(() => {}, conn)
-    assert.strictEqual(conn.transaction.notes.amqp_job_id, '')
-    assert.strictEqual(conn.transaction.notes.amqp_ip_id, '')
+  it('stashes message_id from Message-ID header stripping angle brackets', () => {
+    conn.transaction.header.add('Message-ID', '<abc-123@mail.example.com>')
+    plugin.hook_queue_outbound(() => {}, conn)
+    assert.strictEqual(conn.transaction.notes.amqp_message_id, 'abc-123@mail.example.com')
+  })
+
+  it('stashes empty string when Message-ID header is absent', () => {
+    plugin.hook_queue_outbound(() => {}, conn)
+    assert.strictEqual(conn.transaction.notes.amqp_message_id, '')
   })
 
   it('trims whitespace from header values', () => {
     conn.transaction.header.add('X-Job-Id', '  job-padded  ')
-    plugin.hook_queue(() => {}, conn)
+    plugin.hook_queue_outbound(() => {}, conn)
     assert.strictEqual(conn.transaction.notes.amqp_job_id, 'job-padded')
   })
 
   it('calls remove_header for X-Job-Id', () => {
     const removed = []
     conn.transaction.remove_header = (n) => removed.push(n)
-    plugin.hook_queue(() => {}, conn)
+    plugin.hook_queue_outbound(() => {}, conn)
     assert.ok(removed.includes('X-Job-Id'))
   })
 
-  it('calls remove_header for X-Ip-Id', () => {
-    const removed = []
-    conn.transaction.remove_header = (n) => removed.push(n)
-    plugin.hook_queue(() => {}, conn)
-    assert.ok(removed.includes('X-Ip-Id'))
-  })
 
   it('calls next()', () => {
     let called = false
-    plugin.hook_queue(() => { called = true }, conn)
+    plugin.hook_queue_outbound(() => { called = true }, conn)
     assert.ok(called)
   })
 
   it('calls next() without error when transaction is null', () => {
     conn.transaction = null
     let called = false
-    assert.doesNotThrow(() => plugin.hook_queue(() => { called = true }, conn))
+    assert.doesNotThrow(() => plugin.hook_queue_outbound(() => { called = true }, conn))
     assert.ok(called)
   })
 
   it('skips header extraction when job_id_header is empty', () => {
     plugin.cfg.headers.job_id_header = ''
     conn.transaction.header.add('X-Job-Id', 'job-abc')
-    plugin.hook_queue(() => {}, conn)
+    plugin.hook_queue_outbound(() => {}, conn)
     assert.strictEqual(conn.transaction.notes.amqp_job_id, '')
   })
 
-  it('skips remove_header when ip_id_header is empty', () => {
-    plugin.cfg.headers.ip_id_header = ''
-    const removed = []
-    conn.transaction.remove_header = (n) => removed.push(n)
-    plugin.hook_queue(() => {}, conn)
-    assert.ok(!removed.includes('X-Ip-Id'))
-  })
 })
 
 // ─── _connect ────────────────────────────────────────────────────────────────
@@ -371,6 +362,13 @@ describe('hook_delivered', () => {
     assert.ok(called)
   })
 
+  it('publishes only once when called twice with the same hmail', () => {
+    const hmail = makeHmail({}, 'example.com', [addr('r@example.com')])
+    plugin.hook_delivered(() => {}, hmail, deliveredParams())
+    plugin.hook_delivered(() => {}, hmail, deliveredParams())
+    assert.strictEqual(published.length, 1)
+  })
+
   it('publishes with routing key outcome.delivered', () => {
     plugin.hook_delivered(() => {}, makeHmail(), deliveredParams())
     assert.strictEqual(published[0].k, 'outcome.delivered')
@@ -384,11 +382,6 @@ describe('hook_delivered', () => {
   it('includes jobId from hmail.todo.notes', () => {
     plugin.hook_delivered(() => {}, makeHmail({ amqp_job_id: 'job-42' }), deliveredParams())
     assert.strictEqual(published[0].e.jobId, 'job-42')
-  })
-
-  it('includes ipId from hmail.todo.notes', () => {
-    plugin.hook_delivered(() => {}, makeHmail({ amqp_ip_id: 'ip-7' }), deliveredParams())
-    assert.strictEqual(published[0].e.ipId, 'ip-7')
   })
 
   it('parses smtpCode from params[2] (SMTP response)', () => {
@@ -412,19 +405,28 @@ describe('hook_delivered', () => {
     assert.strictEqual(published[0].e.domain, 'gmail.com')
   })
 
-  it('falls back to params[0] host for domain when hmail.todo.domain is absent', () => {
+  it('includes senderAddress from hmail.todo.mail_from', () => {
+    const hmail = {
+      todo: { notes: {}, domain: 'example.com', rcpt_to: [], mail_from: { address: () => 'sender@example.com' } },
+    }
+    plugin.hook_delivered(() => {}, hmail, deliveredParams())
+    assert.strictEqual(published[0].e.senderAddress, 'sender@example.com')
+  })
+
+  it('uses empty string for domain when hmail.todo.domain is absent', () => {
     plugin.hook_delivered(
       () => {},
       { todo: { notes: {}, rcpt_to: [] } },
       ['mail.gmail.com', null, '250 OK', 0, 25, 'smtp', [addr('r@gmail.com')]],
     )
-    assert.strictEqual(published[0].e.domain, 'mail.gmail.com')
+    assert.strictEqual(published[0].e.domain, '')
   })
 
-  it('sets attemptedAt to an ISO 8601 string', () => {
+  it('sets attemptedAt to a Unix ms timestamp', () => {
     plugin.hook_delivered(() => {}, makeHmail(), deliveredParams())
     const { attemptedAt } = published[0].e
-    assert.strictEqual(new Date(attemptedAt).toISOString(), attemptedAt)
+    assert.strictEqual(typeof attemptedAt, 'number')
+    assert.ok(attemptedAt > 0)
   })
 
   it('publishes no events when params is null', () => {
