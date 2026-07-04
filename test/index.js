@@ -279,6 +279,29 @@ describe('hook_queue_outbound', () => {
     assert.strictEqual(conn.transaction.notes.amqp_job_id, 'job-padded')
   })
 
+  it('stashes the bare address from a From header with a display name', () => {
+    conn.transaction.header.add('From', '"Acme Support" <no-reply@acme.test>')
+    plugin.hook_queue_outbound(() => {}, conn)
+    assert.strictEqual(conn.transaction.notes.amqp_from, 'no-reply@acme.test')
+  })
+
+  it('stashes empty string when From header is absent', () => {
+    plugin.hook_queue_outbound(() => {}, conn)
+    assert.strictEqual(conn.transaction.notes.amqp_from, '')
+  })
+
+  it('stashes the first address from a multi-address From header', () => {
+    conn.transaction.header.add('From', 'Acme <a@acme.test>, ops@acme.test')
+    plugin.hook_queue_outbound(() => {}, conn)
+    assert.strictEqual(conn.transaction.notes.amqp_from, 'a@acme.test')
+  })
+
+  it('stashes empty string when the From header is unparseable', () => {
+    conn.transaction.header.add('From', 'not-an-address')
+    plugin.hook_queue_outbound(() => {}, conn)
+    assert.strictEqual(conn.transaction.notes.amqp_from, '')
+  })
+
   it('calls remove_header for X-Job-Id', () => {
     const removed = []
     conn.transaction.remove_header = (n) => removed.push(n)
@@ -607,7 +630,21 @@ describe('address extraction from queue-shaped objects', () => {
     assert.doesNotThrow(() => plugin.hook_delivered(() => {}, hmail, deliveredParams('test@recipient1.test')))
   })
 
-  it('strips angle brackets from the VERP senderAddress', () => {
+  it('reports the real From header as senderAddress, not the VERP envelope', () => {
+    const verp = 'bounces+MJCHEduq.XXX.test=recipient1.test@brd.spf.dopasend.com'
+    const hmail = {
+      todo: {
+        notes: { amqp_from: 'no-reply@acme.test' },
+        domain: 'recipient1.test',
+        mail_from: { original: `<${verp}>` },
+        rcpt_to: [],
+      },
+    }
+    const ctx = plugin._extract_hmail_context(hmail)
+    assert.strictEqual(ctx.senderAddress, 'no-reply@acme.test')
+  })
+
+  it('falls back to the envelope MAIL FROM when no From note was captured', () => {
     const verp = 'bounces+MJCHEduq.XXX.test=recipient1.test@brd.spf.dopasend.com'
     const hmail = {
       todo: { notes: {}, domain: 'recipient1.test', mail_from: { original: `<${verp}>` }, rcpt_to: [] },

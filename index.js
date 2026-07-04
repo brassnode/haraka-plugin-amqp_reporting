@@ -1,6 +1,7 @@
 'use strict'
 
 const amqplib = require('amqplib/callback_api')
+const addrparser = require('address-rfc2822')
 
 const plugin = exports
 
@@ -146,6 +147,7 @@ plugin.hook_queue_outbound = function (next, connection) {
 
   const rawMsgId = txn.header.get('Message-ID') || ''
   txn.notes.amqp_message_id = rawMsgId.replace(/^<|>$/g, '').trim()
+  txn.notes.amqp_from = this._parse_from_address(txn.header.get('From'))
 
   if (jobIdHeader) txn.remove_header(jobIdHeader)
 
@@ -244,7 +246,7 @@ plugin._extract_hmail_context = function (hmail) {
     notes,
     queueId: todo.uuid || '',
     messageId: notes.amqp_message_id || '',
-    senderAddress: todo.mail_from ? todo.mail_from.original.slice(1, -1) : '',
+    senderAddress: notes.amqp_from || (todo.mail_from ? todo.mail_from.original.slice(1, -1) : ''),
     domain: todo.domain || '',
     rcpts,
     rcpt: rcpts.length ? rcpts[0].original.slice(1, -1) : '',
@@ -286,6 +288,20 @@ plugin._build_outcome_event = function (context, params) {
 plugin._parse_smtp_code = function (msg, fallback) {
   const m = /^(\d{3})/.exec(msg || '')
   return m ? parseInt(m[1], 10) : fallback
+}
+
+plugin._parse_from_address = function (raw) {
+  const s = (raw || '').trim()
+  if (!s) return ''
+  try {
+    const parsed = addrparser.parse(s)
+    if (parsed && parsed.length && parsed[0].address) return parsed[0].address
+  } catch (e) {
+    this.logdebug(
+      `Unparseable From header - reporting no sender: ${e.message}`,
+    )
+  }
+  return ''
 }
 
 // ─── Publishing ───────────────────────────────────────────────────────────────

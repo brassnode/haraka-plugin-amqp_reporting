@@ -37,6 +37,7 @@
   },
   "homepage": "https://github.com/haraka/haraka-plugin-amqp_reporting#readme",
   "dependencies": {
+    "address-rfc2822": "^2.2.4",
     "amqplib": "^0.10.4"
   },
   "devDependencies": {
