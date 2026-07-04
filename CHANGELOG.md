@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.5 - 2026-07-04
+
+### Fixed
+
+- Outbound outcome hooks crashed with `TypeError: todo.mail_from.address is not a function`. `hmail.todo.mail_from` / `rcpt_to` / `params[6]` are deserialized from the queue file as plain objects without the `address-rfc2821` `Address` prototype, so the `.address()` method is unavailable. Now read the `.original` property (angle brackets stripped) instead. Fixes dropped `outcome.delivered` / `outcome.bounced` / `outcome.deferred` events on the outbound-relay path.
+
 ## 1.1.4 - 2026-05-15
 
 ### Removed

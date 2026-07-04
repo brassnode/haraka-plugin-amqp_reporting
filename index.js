@@ -172,7 +172,7 @@ plugin.hook_delivered = function (next, hmail, params) {
   next()
 
   for (const rcpt of okRcpts) {
-    const address = rcpt.address()
+    const address = rcpt.original.slice(1, -1)
     this.logdebug(
       `delivered - jobId: ${notes.amqp_job_id || '(none)'}, rcpt: ${address}, domain: ${domain}, smtpCode: ${code}`,
     )
@@ -196,7 +196,7 @@ plugin.hook_bounce = function (next, hmail, error) {
   next()
 
   for (const rcptObj of rcpts) {
-    const address = rcptObj.address()
+    const address = rcptObj.original.slice(1, -1)
     this.logdebug(
       `bounce - jobId: ${notes.amqp_job_id || '(none)'}, rcpt: ${address}, domain: ${domain}, smtpCode: ${code}, msg: ${msg}`,
     )
@@ -220,7 +220,7 @@ plugin.hook_deferred = function (next, hmail, params) {
   next()
 
   for (const rcptObj of rcpts) {
-    const address = rcptObj.address()
+    const address = rcptObj.original.slice(1, -1)
     this.logdebug(
       `deferred - jobId: ${notes.amqp_job_id || '(none)'}, rcpt: ${address}, domain: ${domain}, smtpCode: ${code}, delay: ${delay}s, msg: ${msg}`,
     )
@@ -244,10 +244,10 @@ plugin._extract_hmail_context = function (hmail) {
     notes,
     queueId: todo.uuid || '',
     messageId: notes.amqp_message_id || '',
-    senderAddress: todo.mail_from ? todo.mail_from.address() : '',
+    senderAddress: todo.mail_from ? todo.mail_from.original.slice(1, -1) : '',
     domain: todo.domain || '',
     rcpts,
-    rcpt: rcpts.length ? rcpts[0].address() : '',
+    rcpt: rcpts.length ? rcpts[0].original.slice(1, -1) : '',
     retryCount: (hmail && hmail.num_failures) || 0,
   }
 }

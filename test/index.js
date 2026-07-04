@@ -22,7 +22,7 @@ function makeHmail(notes = {}, domain = 'example.com', rcpts = []) {
 }
 
 function addr(email) {
-  return { address: () => email }
+  return { original: `<${email}>` }
 }
 
 // Standard delivered params with one recipient — used when the specific recipient doesn't matter
@@ -407,7 +407,7 @@ describe('hook_delivered', () => {
 
   it('includes senderAddress from hmail.todo.mail_from', () => {
     const hmail = {
-      todo: { notes: {}, domain: 'example.com', rcpt_to: [], mail_from: { address: () => 'sender@example.com' } },
+      todo: { notes: {}, domain: 'example.com', rcpt_to: [], mail_from: { original: '<sender@example.com>' } },
     }
     plugin.hook_delivered(() => {}, hmail, deliveredParams())
     assert.strictEqual(published[0].e.senderAddress, 'sender@example.com')
@@ -578,6 +578,51 @@ describe('hook_deferred', () => {
   it('handles null hmail gracefully', () => {
     assert.doesNotThrow(() => plugin.hook_deferred(() => {}, null, null))
     assert.strictEqual(published.length, 0)
+  })
+})
+
+// ─── address extraction (queue-shaped todo) ──────────────────────────────────
+
+// Regression: outbound todos are deserialized from the queue file as plain
+// objects with `.original` but no `.address()` method. These must not throw and
+// must yield the bare address (angle brackets stripped).
+describe('address extraction from queue-shaped objects', () => {
+  let published
+
+  beforeEach(() => {
+    published = []
+    plugin._publish = (k, e) => published.push({ k, e })
+    plugin.logdebug = () => {}
+  })
+
+  it('does not throw when mail_from/rcpt_to lack an .address() method', () => {
+    const hmail = {
+      todo: {
+        notes: {},
+        domain: 'recipient1.test',
+        mail_from: { original: '<bounces+MJCHEduq.XXX.test=recipient1.test@brd.spf.dopasend.com>' },
+        rcpt_to: [addr('test@recipient1.test')],
+      },
+    }
+    assert.doesNotThrow(() => plugin.hook_delivered(() => {}, hmail, deliveredParams('test@recipient1.test')))
+  })
+
+  it('strips angle brackets from the VERP senderAddress', () => {
+    const verp = 'bounces+MJCHEduq.XXX.test=recipient1.test@brd.spf.dopasend.com'
+    const hmail = {
+      todo: { notes: {}, domain: 'recipient1.test', mail_from: { original: `<${verp}>` }, rcpt_to: [] },
+    }
+    const ctx = plugin._extract_hmail_context(hmail)
+    assert.strictEqual(ctx.senderAddress, verp)
+  })
+
+  it('returns empty string for the null sender <>', () => {
+    const hmail = { todo: { notes: {}, mail_from: { original: '<>' }, rcpt_to: [] } }
+    assert.strictEqual(plugin._extract_hmail_context(hmail).senderAddress, '')
+  })
+
+  it('returns empty string when mail_from is absent', () => {
+    assert.strictEqual(plugin._extract_hmail_context({ todo: { notes: {} } }).senderAddress, '')
   })
 })
 
